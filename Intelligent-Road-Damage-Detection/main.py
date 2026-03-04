@@ -1,24 +1,66 @@
 import os
 import io
-import base64
-import random
+import uuid
 import json
 import sqlite3
 import smtplib
 from email.message import EmailMessage
 from typing import List, Optional
-from datetime import datetime
+from datetime import datetime, timedelta
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from ultralytics import YOLO
 from PIL import Image
-import numpy as np
 
-app = FastAPI()
+# Load .env credentials safely
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
-# Enable CORS for React development
+# ─── Email Config ─────────────────────────────────────────────────────
+EMAIL_USER = os.getenv("EMAIL_USER", "gamehater005@gmail.com")
+EMAIL_PASS = os.getenv("EMAIL_PASS", "YOUR_APP_PASSWORD_HERE")
+
+# ─── Fix 1: Orphan Image Cleanup ──────────────────────────────────────
+def cleanup_orphan_images():
+    """
+    Deletes uploads/tmp_* files older than 1 hour.
+    These are images saved during /analyze that were never confirmed via /submit.
+    Called once at server startup.
+    """
+    uploads_dir = "uploads"
+    if not os.path.exists(uploads_dir):
+        return
+    cutoff = datetime.now() - timedelta(hours=1)
+    count = 0
+    for fname in os.listdir(uploads_dir):
+        if fname.startswith("tmp_"):
+            fpath = os.path.join(uploads_dir, fname)
+            try:
+                mtime = datetime.fromtimestamp(os.path.getmtime(fpath))
+                if mtime < cutoff:
+                    os.remove(fpath)
+                    count += 1
+            except Exception as e:
+                print(f"[Cleanup] Could not remove {fpath}: {e}")
+    print(f"[Cleanup] ✅ Removed {count} orphan tmp_ file(s) older than 1 hour")
+
+# ─── Lifespan: startup tasks ──────────────────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    os.makedirs("uploads", exist_ok=True)
+    init_db()
+    cleanup_orphan_images()   # Fix 1: clean up leftover tmp_ files on boot
+    yield
+
+# ─── App Setup ────────────────────────────────────────────────────────
+app = FastAPI(title="IRDDP API", version="3.1.0", lifespan=lifespan)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -30,360 +72,732 @@ app.add_middleware(
 os.makedirs("uploads", exist_ok=True)
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
-# --- Persistence Logic ---
+# ─── Database ─────────────────────────────────────────────────────────
 DB_FILE = "reports.db"
 
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS reports (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            report_id TEXT,
-            citizen_name TEXT,
-            citizen_email TEXT,
-            citizen_phone TEXT,
-            location TEXT,
-            pothole_count INTEGER,
-            severity TEXT,
-            priority TEXT,
-            confidence REAL,
-            image_path TEXT,
-            processed_image_path TEXT,
-            status TEXT DEFAULT 'OPEN',
-            created_at TEXT
-        )
-    ''')
-    
-    # Try adding missing column if migrating from old DB schema
-    try:
-        cursor.execute('ALTER TABLE reports ADD COLUMN processed_image_path TEXT')
-    except sqlite3.OperationalError:
-        pass # Column might already exist
-    
-    conn.commit()
-    conn.close()
-
-init_db()
-
-def save_report_to_db(report_data):
-    try:
-        conn = sqlite3.connect(DB_FILE)
+    # Fix 5: use context manager for DB safety
+    with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
         cursor.execute('''
-            INSERT INTO reports (
-                report_id, citizen_name, citizen_email, location,
-                pothole_count, severity, priority, confidence, image_path, processed_image_path, status, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            report_data.get('report_id'),
-            report_data.get('citizen_name'),
-            report_data.get('citizen_email'),
-            report_data.get('location'),
-            report_data.get('pothole_count'),
-            report_data.get('severity'),
-            report_data.get('priority'),
-            report_data.get('confidence'),
-            report_data.get('image_path'),
-            report_data.get('processed_image_path'),
-            report_data.get('status', 'OPEN'),
-            report_data.get('created_at')
-        ))
-        conn.commit()
-        conn.close()
+            CREATE TABLE IF NOT EXISTS reports (
+                id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+                report_id             TEXT UNIQUE,
+                citizen_name          TEXT,
+                citizen_email         TEXT,
+                citizen_phone         TEXT,
+                location              TEXT,
+                total_potholes        INTEGER DEFAULT 0,
+                worst_severity        TEXT,
+                overall_priority      TEXT,
+                max_confidence        REAL,
+                image_count           INTEGER DEFAULT 1,
+                image_paths           TEXT,
+                processed_image_paths TEXT,
+                status                TEXT DEFAULT 'OPEN',
+                created_at            TEXT
+            )
+        ''')
+        migrations = [
+            "ALTER TABLE reports ADD COLUMN total_potholes INTEGER DEFAULT 0",
+            "ALTER TABLE reports ADD COLUMN worst_severity TEXT",
+            "ALTER TABLE reports ADD COLUMN overall_priority TEXT",
+            "ALTER TABLE reports ADD COLUMN max_confidence REAL",
+            "ALTER TABLE reports ADD COLUMN image_count INTEGER DEFAULT 1",
+            "ALTER TABLE reports ADD COLUMN image_paths TEXT",
+            "ALTER TABLE reports ADD COLUMN processed_image_paths TEXT",
+        ]
+        for sql in migrations:
+            try:
+                cursor.execute(sql)
+            except sqlite3.OperationalError:
+                pass
+
+def save_report_to_db(data: dict):
+    try:
+        # Fix 5: context manager — auto-commits on success, auto-rolls back on exception
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO reports (
+                    report_id, citizen_name, citizen_email, citizen_phone, location,
+                    total_potholes, worst_severity, overall_priority, max_confidence,
+                    image_count, image_paths, processed_image_paths, status, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                data.get("report_id"),
+                data.get("citizen_name", ""),
+                data.get("citizen_email", ""),
+                data.get("citizen_phone", ""),
+                data.get("location", ""),
+                data.get("total_potholes", 0),
+                data.get("worst_severity", ""),
+                data.get("overall_priority", ""),
+                data.get("max_confidence", 0.0),
+                data.get("image_count", 1),
+                json.dumps(data.get("image_paths", [])),
+                json.dumps(data.get("processed_image_paths", [])),
+                data.get("status", "OPEN"),
+                data.get("created_at", datetime.now().isoformat()),
+            ))
+        print(f"[DB] ✅ Saved report {data.get('report_id')}")
     except Exception as e:
-        print(f"DB Save Error: {e}")
+        print(f"[DB] ❌ Save Error: {e}")
 
-# --- Email Automation Logic ---
-def send_confirmation_email_task(user_name: str, user_email: str, report_id: str, pothole_count: int, severity: str, priority: str):
-    if not user_email or "@" not in user_email:
-        print(f"Skipping email to {user_name} - Invalid address: {user_email}")
+# ─── Fix 3 & 4: File Type + Size Validation ───────────────────────────
+MAX_FILE_SIZE_BYTES  = 10 * 1024 * 1024   # 10 MB per image
+MAX_BATCH_SIZE_BYTES = 50 * 1024 * 1024   # 50 MB total
+
+MAGIC_BYTES = {
+    "jpeg": (b"\xFF\xD8\xFF",),
+    "png":  (b"\x89\x50\x4E\x47",),
+    # WEBP: starts with RIFF at 0 and WEBP at byte 8
+}
+
+def validate_image_file(filename: str, contents: bytes) -> None:
+    """
+    Raises HTTPException(400) if:
+    - file size exceeds 10 MB
+    - magic bytes don't match JPEG, PNG, or WEBP
+    """
+    # Size check
+    if len(contents) > MAX_FILE_SIZE_BYTES:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "filename": filename,
+                "reason": f"File too large ({len(contents) // (1024*1024)}MB). Max allowed is 10MB per image."
+            }
+        )
+    # Magic bytes check
+    header = contents[:12]
+    is_jpeg = header[:3] == b"\xFF\xD8\xFF"
+    is_png  = header[:4] == b"\x89\x50\x4E\x47"
+    is_webp = header[:4] == b"\x52\x49\x46\x46" and header[8:12] == b"\x57\x45\x42\x50"
+
+    if not (is_jpeg or is_png or is_webp):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "filename": filename,
+                "reason": "Invalid file type. Only JPEG, PNG, and WEBP images are accepted."
+            }
+        )
+
+# ─── Email ────────────────────────────────────────────────────────────
+def send_email_task(
+    citizen_name: str,
+    citizen_email: str,
+    report_id: str,
+    total_potholes: int,
+    worst_severity: str,
+    overall_priority: str,
+    image_count: int,
+    location: str,
+):
+    if not citizen_email or "@" not in citizen_email:
+        print(f"[Email] Skipping — invalid address: {citizen_email}")
         return
-        
+
+    action_map = {
+        "LOW":      "Regular monitoring has been scheduled.",
+        "MEDIUM":   "A repair has been scheduled.",
+        "HIGH":     "Immediate maintenance has been flagged.",
+        "CRITICAL": "Emergency response team has been notified.",
+        "CLEAR":    "No action needed — road is in good condition.",
+    }
+    action_note = action_map.get(overall_priority, "Under review.")
+
     msg = EmailMessage()
-    msg['Subject'] = f"Road Damage Complaint Registered – {report_id}"
-    msg['From'] = "notify@nationalroadinfrastructure.gov.in" # Dummy sender
-    msg['To'] = user_email
-    
-    body = f"""Hello {user_name or 'Citizen'},
+    msg["Subject"] = f"Road Damage Report Confirmed — {report_id}"
+    msg["From"]    = EMAIL_USER
+    msg["To"]      = citizen_email
 
-Your road damage complaint has been successfully registered.
+    body = f"""Hello {citizen_name or 'Citizen'},
 
-Report Details:
-Report ID: {report_id}
-Detected Potholes: {pothole_count}
-Highest Severity: {severity}
-Priority Level: {priority}
+Your road damage report has been officially submitted and recorded.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+REPORT DETAILS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Report ID       : {report_id}
+Location        : {location or 'Not specified'}
+Images Analyzed : {image_count}
+Total Potholes  : {total_potholes}
+Worst Severity  : {worst_severity}
+Priority Level  : {overall_priority}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Next Step: {action_note}
+
+Track your report anytime using Report ID: {report_id}
 
 Thank you for helping improve road infrastructure.
 
-Regards  
-National Road Infrastructure Assessment System
+Regards,
+Intelligent Road Damage Detection and Prioritization System
+VI Semester Capstone Project — CSE
 """
     msg.set_content(body)
-    
+
     try:
-        # Connect to Gmail's SMTP server
-        server = smtplib.SMTP('smtp.gmail.com', 587)
-        server.starttls() # Secure the connection
-        # Login with your real email and an App Password (NOT your normal password)
-        # TODO: Replace with your actual Gmail and Google App Password
-        server.login("YOUR_EMAIL@gmail.com", "YOUR_APP_PASSWORD") 
+        server = smtplib.SMTP("smtp.gmail.com", 587)
+        server.ehlo()
+        server.starttls()
+        server.ehlo()
+        server.login(EMAIL_USER, EMAIL_PASS)
         server.send_message(msg)
         server.quit()
-        print(f"Successfully sent REAL confirmation to {user_email} for {report_id}")
+        print(f"[Email] ✅ Sent to {citizen_email} for {report_id}")
+    except smtplib.SMTPAuthenticationError as e:
+        print(f"[Email] ❌ Auth failed — SMTP code: {e.smtp_code}, message: {e.smtp_error}")
+        print(f"[Email]    EMAIL_USER={EMAIL_USER}")
+        print(f"[Email]    EMAIL_PASS length={len(EMAIL_PASS)} chars (should be 16)")
     except Exception as e:
-        print(f"Failed to send automated email: {e}")
+        print(f"[Email] ❌ Failed ({type(e).__name__}): {e}")
 
-# --- Model Loading Logic ---
+# --- Priority Helpers ---
+PRIORITY_ORDER = ["LOW", "MEDIUM", "HIGH", "CRITICAL"]
+
+def score_to_priority(score: float) -> tuple:
+    if score < 1.5:  return "LOW",      "Monitor"
+    if score <= 2.5: return "MEDIUM",   "Schedule Repair"
+    if score <= 3.2: return "HIGH",     "Immediate Maintenance"
+    return            "CRITICAL",  "Emergency Response Required"
+
+def pick_worst_priority(p1: str, p2: str) -> str:
+    i1 = PRIORITY_ORDER.index(p1) if p1 in PRIORITY_ORDER else 0
+    i2 = PRIORITY_ORDER.index(p2) if p2 in PRIORITY_ORDER else 0
+    return PRIORITY_ORDER[max(i1, i2)]
+
+def pick_worst_severity(s1: str, s2: str) -> str:
+    order = ["Minor", "Moderate", "Severe"]
+    i1 = order.index(s1) if s1 in order else 0
+    i2 = order.index(s2) if s2 in order else 0
+    return order[max(i1, i2)]
+
+def calculate_severity(x1: float, y1: float, x2: float, y2: float,
+                       image_width: int, image_height: int) -> tuple:
+    """
+    Improved severity calculation with 3 factors:
+
+    1. AREA RATIO     — how much of the road is damaged (existing logic)
+    2. POSITION FACTOR — center-of-lane potholes are more dangerous than edge ones
+    3. SHAPE FACTOR   — square/round potholes are deeper than long thin cracks
+
+    Returns: (adjusted_weight: float, severity_label: str, base_weight: int)
+    """
+    full_area  = image_width * image_height
+
+    # --- Factor 1: Area ratio ---
+    bbox_area  = (x2 - x1) * (y2 - y1)
+    area_ratio = (bbox_area / full_area) * 100
+
+    if area_ratio < 4:
+        base_weight = 1
+        label       = "Minor"
+    elif area_ratio <= 10:
+        base_weight = 2
+        label       = "Moderate"
+    else:
+        base_weight = 3
+        label       = "Severe"
+
+    # --- Factor 2: Position factor ---
+    # Horizontal center of pothole vs center of image
+    # 0.0 = dead center (most dangerous), 1.0 = at the edge
+    bbox_cx      = (x1 + x2) / 2
+    img_cx       = image_width / 2
+    center_dist  = abs(bbox_cx - img_cx) / (image_width / 2)
+    # Center potholes get up to +20% boost, edge potholes get -0% (neutral)
+    position_factor = 1.2 - (0.2 * center_dist)   # range: 1.0 to 1.2
+
+    # --- Factor 3: Shape factor ---
+    # Aspect ratio: 1.0 = perfect square (deep pothole), 0.0 = very elongated (surface crack)
+    w       = max(x2 - x1, 1)
+    h       = max(y2 - y1, 1)
+    aspect  = min(w, h) / max(w, h)                # range: 0.0 to 1.0
+    # Square potholes (aspect ~1.0) get +10% boost, cracks (aspect ~0.1) are neutral
+    shape_factor = 0.9 + (0.2 * aspect)            # range: 0.9 to 1.1
+
+    # --- Final adjusted weight ---
+    adjusted_weight = base_weight * position_factor * shape_factor
+
+    return adjusted_weight, label, base_weight
+
+# ─── Model ────────────────────────────────────────────────────────────
 def find_best_model():
     search_dir = "runs/detect"
     if os.path.exists(search_dir):
         try:
-            train_dirs = sorted([d for d in os.listdir(search_dir) if d.startswith("train")], reverse=True)
+            train_dirs = sorted(
+                [d for d in os.listdir(search_dir) if d.startswith("train")],
+                reverse=True
+            )
             for d in train_dirs:
                 p = os.path.join(search_dir, d, "weights", "best.pt")
                 if os.path.exists(p):
                     return p
         except Exception:
             pass
-    return "yolov8n.pt"
+    return "best.pt"
 
-# Robustly initialize model into app state
 model_path = find_best_model()
-print(f"Loading model into app state from: {model_path}")
+print(f"[Model] Loading from: {model_path}")
 app.state.model = YOLO(model_path)
 
-@app.post("/detect")
-async def detect_damage(
+# ─── /analyze — AI only, NO side effects ─────────────────────────────
+@app.post("/analyze")
+async def analyze_images(
     request: Request,
-    background_tasks: BackgroundTasks,
     files: List[UploadFile] = File(...),
-    citizen_name: Optional[str] = Form(""),
-    citizen_email: Optional[str] = Form(""),
-    location: Optional[str] = Form("")
 ):
+    """
+    Phase 1: Run AI detection only.
+    Fix 1: Images saved with tmp_ prefix. Renamed to permanent on /submit.
+    Fix 3&4: Validates file type (magic bytes) and size before processing.
+    Does NOT generate Report ID, does NOT save to DB, does NOT send email.
+    """
     if len(files) > 10:
         raise HTTPException(status_code=400, detail="Maximum 10 images allowed")
 
+    # Fix 3&4: Read all files first and validate total batch size
+    file_contents = []
+    total_bytes = 0
+    for file in files:
+        contents = await file.read()
+        total_bytes += len(contents)
+        if total_bytes > MAX_BATCH_SIZE_BYTES:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "filename": file.filename,
+                    "reason": "Total batch size exceeds 50MB limit. Please reduce the number or size of images."
+                }
+            )
+        # Fix 3&4: Validate individual file
+        validate_image_file(file.filename, contents)
+        file_contents.append((file.filename, contents))
+
+    timestamp_base = datetime.now().strftime("%Y%m%d_%H%M%S")
+    batch_total_potholes   = 0
+    batch_overall_priority = "LOW"
+    batch_worst_severity   = "Minor"
+    batch_max_confidence   = 0.0
+    batch_image_paths      = []
+    batch_processed_paths  = []
+    batch_has_detection    = False
+    results_list           = []
+
     try:
-        results_list = []
-        for file in files:
-            # Save original file to disk
-            timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            safe_filename = file.filename.replace(" ", "_").replace("/", "_").replace("\\", "_")
-            file_path = os.path.join("uploads", f"{timestamp_str}_{safe_filename}")
-            
-            contents = await file.read()
+        for idx, (filename, contents) in enumerate(file_contents):
+            timestamp_str = f"{timestamp_base}_{idx:02d}"
+            safe_filename = (
+                filename
+                .replace(" ", "_").replace("/", "_").replace("\\", "_")
+            )
+
+            # Fix 1: Save with tmp_ prefix — will be renamed on /submit
+            file_path = os.path.join("uploads", f"tmp_{timestamp_str}_{safe_filename}")
+
             with open(file_path, "wb") as f:
                 f.write(contents)
-            
-            # Read image for processing
-            image = Image.open(io.BytesIO(contents)).convert("RGB")
+
+            image        = Image.open(io.BytesIO(contents)).convert("RGB")
             width, height = image.size
-            full_area = width * height
-            
-            # Run detection using state-stored model
-            results = request.app.state.model(image)
-            
-            # Process results
-            boxes = results[0].boxes
-            detections = []
+            full_area    = width * height
+
+            yolo_results = request.app.state.model(image)
+            boxes        = yolo_results[0].boxes
+
+            detections       = []
             severity_weights = []
-            max_conf = 0.0
-            
+            max_conf         = 0.0
+
             if boxes is not None:
                 for box in boxes:
                     confidence = float(box.conf[0])
-                    if confidence < 0.6: continue
-                    
-                    if confidence > max_conf: max_conf = confidence
-                    
+                    if confidence < 0.6:
+                        continue
+                    if confidence > max_conf:
+                        max_conf = confidence
+
                     x1, y1, x2, y2 = box.xyxy[0].tolist()
-                    bbox_area = (x2 - x1) * (y2 - y1)
-                    
-                    area_ratio = (bbox_area / full_area) * 100
-                    weight = 1 if area_ratio < 4 else 2 if area_ratio <= 10 else 3
-                    
-                    severity_weights.append(weight)
+
+                    # Improved severity — position + shape aware
+                    adj_weight, sev_label, base_weight = calculate_severity(
+                        x1, y1, x2, y2, width, height
+                    )
+
+                    severity_weights.append(adj_weight)
                     detections.append({
-                        "confidence": confidence,
-                        "weight": weight,
-                        "bbox": [x1, y1, x2, y2]
+                        "confidence":   confidence,
+                        "weight":       adj_weight,
+                        "base_weight":  base_weight,
+                        "severity":     sev_label,
+                        "bbox":         [x1, y1, x2, y2],
                     })
-            
-            report = None
+
+            processed_file_path = file_path  # default if no detection
+            image_report        = None
+
             if detections:
-                pothole_count = len(detections)
-                density_weight = 1 if pothole_count == 1 else 2 if pothole_count <= 3 else 3
+                batch_has_detection = True
+                pothole_count   = len(detections)
+                density_weight  = 1 if pothole_count == 1 else 2 if pothole_count <= 3 else 3
                 conf_multiplier = 1.0 if max_conf <= 0.85 else 1.2
-                
-                avg_severity = sum(severity_weights) / len(severity_weights)
-                base_score = (avg_severity * 0.6) + (density_weight * 0.4)
-                final_score = base_score * conf_multiplier
-                
-                if final_score < 1.5:
-                    priority, action = "LOW", "Monitor"
-                elif final_score <= 2.5:
-                    priority, action = "MEDIUM", "Schedule Repair"
-                elif final_score <= 3.2:
-                    priority, action = "HIGH", "Immediate Maintenance"
-                else:
-                    priority, action = "CRITICAL", "Emergency Response Required"
-                
-                max_weight = max(severity_weights)
-                severity_label = "Minor" if max_weight == 1 else "Moderate" if max_weight == 2 else "Severe"
-                
-                report_id = f"RD-{datetime.now().year}-{random.randint(10000, 99999)}"
-                report = {
-                    "report_id": report_id,
-                    "detected_potholes": pothole_count,
-                    "highest_severity": severity_label,
-                    "priority_level": priority,
-                    "recommended_action": action,
-                    "confidence_level": f"{max_conf:.4f}",
-                    "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                }
-                
-                # Result image logic
-                result_img = results[0].plot()
-                res_pil = Image.fromarray(result_img[:, :, ::-1])
-                processed_filename = f"proc_{timestamp_str}_{safe_filename}"
-                processed_file_path = os.path.join("uploads", processed_filename)
-                
-                # Use RGB mode for saving to avoid JPEG error
-                res_pil = res_pil.convert("RGB")
+
+                # Improved score: max severity drives 70%, avg gives context 30%
+                # One critical pothole = critical road, not averaged away
+                max_severity    = max(severity_weights)
+                avg_severity    = sum(severity_weights) / len(severity_weights)
+                combined_sev    = (max_severity * 0.7) + (avg_severity * 0.3)
+
+                base_score      = (combined_sev * 0.6) + (density_weight * 0.4)
+                final_score     = base_score * conf_multiplier
+
+                priority, action = score_to_priority(final_score)
+
+                # Severity label based on worst base_weight (not adjusted) for clean display
+                worst_base = max(d["base_weight"] for d in detections)
+                severity_label = "Minor" if worst_base == 1 else "Moderate" if worst_base == 2 else "Severe"
+
+                batch_total_potholes   += pothole_count
+                batch_max_confidence    = max(batch_max_confidence, max_conf)
+                batch_overall_priority  = pick_worst_priority(batch_overall_priority, priority)
+                batch_worst_severity    = pick_worst_severity(batch_worst_severity, severity_label)
+
+                result_img  = yolo_results[0].plot()
+                res_pil     = Image.fromarray(result_img[:, :, ::-1]).convert("RGB")
+                # Fix 1: processed image also gets tmp_ prefix
+                proc_fname  = f"tmp_proc_{timestamp_str}_{safe_filename}"
+                processed_file_path = os.path.join("uploads", proc_fname)
                 res_pil.save(processed_file_path, format="JPEG")
 
-                # Save report to DB
-                save_report_to_db({
-                    "report_id": report_id,
-                    "citizen_name": citizen_name,
-                    "citizen_email": citizen_email,
-                    "location": location,
-                    "pothole_count": pothole_count,
-                    "severity": severity_label,
-                    "priority": priority,
-                    "confidence": float(max_conf),
-                    "image_path": file_path,
-                    "processed_image_path": processed_file_path,
-                    "status": "OPEN",
-                    "created_at": datetime.now().isoformat()
-                })
-                
-                # Automatically enqueue the confirmation email
-                if citizen_email:
-                    background_tasks.add_task(
-                        send_confirmation_email_task,
-                        citizen_name,
-                        citizen_email,
-                        report_id,
-                        pothole_count,
-                        severity_label,
-                        priority
-                    )
-            else:
-                processed_file_path = file_path # If no detections, original is processed
-            
+                image_report = {
+                    "image_index":        idx + 1,
+                    "detected_potholes":  pothole_count,
+                    "highest_severity":   severity_label,
+                    "priority_level":     priority,
+                    "recommended_action": action,
+                    "confidence_level":   f"{max_conf:.4f}",
+                }
+
+            batch_image_paths.append(file_path)
+            batch_processed_paths.append(processed_file_path)
+
             results_list.append({
-                "filename": file.filename,
-                "detections": detections,
-                "image_url": f"/{file_path}",
+                "filename":            filename,
+                "image_index":         idx + 1,
+                "image_url":           f"/{file_path}",
                 "processed_image_url": f"/{processed_file_path}",
-                "report": report
+                "image_report":        image_report,
             })
-            
-        return {"results": results_list}
+
+        action_map = {
+            "LOW":      "Monitor",
+            "MEDIUM":   "Schedule Repair",
+            "HIGH":     "Immediate Maintenance",
+            "CRITICAL": "Emergency Response Required",
+        }
+        batch_summary = {
+            "total_images":       len(file_contents),
+            "total_potholes":     batch_total_potholes,
+            "worst_severity":     batch_worst_severity if batch_has_detection else "None",
+            "overall_priority":   batch_overall_priority if batch_has_detection else "CLEAR",
+            "recommended_action": action_map.get(batch_overall_priority, "Monitor") if batch_has_detection else "No action needed",
+            "max_confidence":     f"{batch_max_confidence:.4f}",
+            "has_detection":      batch_has_detection,
+        }
+
+        return {
+            "batch_summary":    batch_summary,
+            "results":          results_list,
+            "_image_paths":     batch_image_paths,
+            "_processed_paths": batch_processed_paths,
+        }
+
+    except HTTPException:
+        raise
     except Exception as e:
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/report/{report_id}")
-def get_report(report_id: str):
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    cursor.execute('''
-        SELECT * FROM reports WHERE report_id = ?
-    ''', (report_id,))
-    row = cursor.fetchone()
-    conn.close()
-    
-    if not row:
-        raise HTTPException(status_code=404, detail="Report not found")
-        
-    data = dict(row)
+
+# ─── /submit — Official confirmation: DB + Email + Report ID ──────────
+class SubmitRequest(BaseModel):
+    citizen_name:     str
+    citizen_email:    Optional[str] = ""
+    citizen_phone:    Optional[str] = ""
+    location:         str
+    image_paths:      List[str]
+    processed_paths:  List[str]
+    total_potholes:   int
+    worst_severity:   str
+    overall_priority: str
+    max_confidence:   str
+    has_detection:    bool
+    total_images:     int
+
+@app.post("/submit")
+async def submit_report(payload: SubmitRequest, background_tasks: BackgroundTasks):
+    """
+    Phase 2: Citizen has reviewed and confirmed.
+    Fix 1: Renames tmp_ images to permanent names.
+    Fix 2: Uses uuid4 for collision-proof Report IDs.
+    Fix 5: DB operations use context manager.
+    """
+    # Fix 2: UUID-based report ID — no collision risk, no silent overwrites
+    uid       = uuid.uuid4().hex[:8].upper()
+    report_id = f"RD-{datetime.now().year}-{uid}"
+    created_at = datetime.now().isoformat()
+
+    # Fix 1: Rename tmp_ files to permanent names
+    permanent_image_paths     = []
+    permanent_processed_paths = []
+
+    for path in payload.image_paths:
+        fname = os.path.basename(path)
+        if fname.startswith("tmp_"):
+            new_fname = fname[4:]  # strip "tmp_"
+            new_path  = os.path.join("uploads", new_fname)
+            if os.path.exists(path):
+                try:
+                    os.rename(path, new_path)
+                    permanent_image_paths.append(new_path)
+                    print(f"[Submit] Renamed {path} → {new_path}")
+                except Exception as e:
+                    print(f"[Submit] Could not rename {path}: {e}")
+                    permanent_image_paths.append(path)
+            elif os.path.exists(new_path):
+                # Already renamed in a previous attempt
+                permanent_image_paths.append(new_path)
+            else:
+                # No detections — original tmp_ was never created as processed
+                # Keep tmp_ path; file still exists from /analyze upload
+                permanent_image_paths.append(path)
+        else:
+            permanent_image_paths.append(path)
+
+    for i, path in enumerate(payload.processed_paths):
+        # No-detection case: processed_path == image_path (same file, already renamed above)
+        if path == payload.image_paths[i]:
+            permanent_processed_paths.append(permanent_image_paths[i])
+            continue
+
+        fname = os.path.basename(path)
+        if fname.startswith("tmp_"):
+            new_fname = fname[4:]
+            new_path  = os.path.join("uploads", new_fname)
+            if os.path.exists(path):
+                try:
+                    os.rename(path, new_path)
+                    permanent_processed_paths.append(new_path)
+                    print(f"[Submit] Renamed {path} → {new_path}")
+                except Exception as e:
+                    print(f"[Submit] Could not rename {path}: {e}")
+                    permanent_processed_paths.append(path)
+            elif os.path.exists(new_path):
+                permanent_processed_paths.append(new_path)
+            else:
+                # Fallback - use the permanent image path
+                permanent_processed_paths.append(permanent_image_paths[i])
+        else:
+            permanent_processed_paths.append(path)
+
+    save_report_to_db({
+        "report_id":             report_id,
+        "citizen_name":          payload.citizen_name,
+        "citizen_email":         payload.citizen_email,
+        "citizen_phone":         payload.citizen_phone,
+        "location":              payload.location,
+        "total_potholes":        payload.total_potholes,
+        "worst_severity":        payload.worst_severity,
+        "overall_priority":      payload.overall_priority,
+        "max_confidence":        float(payload.max_confidence),
+        "image_count":           payload.total_images,
+        "image_paths":           permanent_image_paths,
+        "processed_image_paths": permanent_processed_paths,
+        "status":                "OPEN",
+        "created_at":            created_at,
+    })
+
+    if payload.citizen_email and "@" in payload.citizen_email:
+        background_tasks.add_task(
+            send_email_task,
+            payload.citizen_name,
+            payload.citizen_email,
+            report_id,
+            payload.total_potholes,
+            payload.worst_severity,
+            payload.overall_priority,
+            payload.total_images,
+            payload.location,
+        )
+
     return {
-        "report_id": data["report_id"],
-        "citizen_name": data["citizen_name"],
-        "citizen_email": data["citizen_email"],
-        "location": data["location"],
-        "detected_potholes": data["pothole_count"],
-        "highest_severity": data["severity"],
-        "priority_level": data["priority"],
-        "confidence_level": f"{data['confidence']:.4f}",
-        "recommended_action": "Monitor" if data["priority"] == "LOW" else "Schedule Repair" if data["priority"] == "MEDIUM" else "Immediate Maintenance" if data["priority"] == "HIGH" else "Emergency Response Required",
-        "generated_at": data["created_at"],
-        "processed_image_url": f"/{data['processed_image_path']}",
-        "original_image_url": f"/{data['image_path']}"
+        "report_id":               report_id,
+        "created_at":              created_at,
+        "status":                  "OPEN",
+        "email_sent":              bool(payload.citizen_email and "@" in payload.citizen_email),
+        # Return permanent paths so frontend can update image URLs (fixes 404 after rename)
+        "permanent_image_paths":     permanent_image_paths,
+        "permanent_processed_paths": permanent_processed_paths,
     }
 
-@app.post("/send-email/{report_id}")
-def send_email(report_id: str):
-    # Retrieve report to ensure exists
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    cursor.execute('''
-        SELECT * FROM reports WHERE report_id = ?
-    ''', (report_id,))
-    row = cursor.fetchone()
-    conn.close()
-    
+
+# ─── /report/{report_id} ──────────────────────────────────────────────
+@app.get("/report/{report_id}")
+def get_report(report_id: str):
+    # Fix 5: context manager
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM reports WHERE report_id = ?", (report_id,))
+        row = cursor.fetchone()
+
     if not row:
         raise HTTPException(status_code=404, detail="Report not found")
-        
+
     data = dict(row)
+
     try:
+        image_paths = json.loads(data.get("image_paths") or "[]")
+    except Exception:
+        image_paths = [data.get("image_paths", "")]
+    try:
+        processed_paths = json.loads(data.get("processed_image_paths") or "[]")
+    except Exception:
+        processed_paths = [data.get("processed_image_paths", "")]
+
+    priority = data.get("overall_priority") or data.get("priority", "LOW")
+    action_map = {
+        "LOW":      "Monitor",
+        "MEDIUM":   "Schedule Repair",
+        "HIGH":     "Immediate Maintenance",
+        "CRITICAL": "Emergency Response Required",
+        "CLEAR":    "No action needed",
+    }
+
+    return {
+        "report_id":           data["report_id"],
+        "citizen_name":        data.get("citizen_name", ""),
+        "citizen_email":       data.get("citizen_email", ""),
+        "citizen_phone":       data.get("citizen_phone", ""),
+        "location":            data.get("location", ""),
+        "detected_potholes":   data.get("total_potholes") or data.get("pothole_count", 0),
+        "highest_severity":    data.get("worst_severity") or data.get("severity", ""),
+        "priority_level":      priority,
+        "confidence_level":    f"{float(data.get('max_confidence') or data.get('confidence') or 0):.4f}",
+        "recommended_action":  action_map.get(priority, "Monitor"),
+        "image_count":         data.get("image_count", 1),
+        "generated_at":        data.get("created_at", ""),
+        "status":              data.get("status", "OPEN"),
+        "processed_image_url": f"/{processed_paths[0]}" if processed_paths else "",
+        "original_image_url":  f"/{image_paths[0]}"     if image_paths     else "",
+        "all_image_urls":      [f"/{p}" for p in image_paths],
+        "all_processed_urls":  [f"/{p}" for p in processed_paths],
+    }
+
+
+# ─── /send-email/{report_id} ──────────────────────────────────────────
+@app.post("/send-email/{report_id}")
+def resend_email(report_id: str):
+    # Fix 5: context manager
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM reports WHERE report_id = ?", (report_id,))
+        row = cursor.fetchone()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Report not found")
+
+    data = dict(row)
+    if not data.get("citizen_email"):
+        raise HTTPException(status_code=400, detail="No email address on record for this report")
+
+    priority = data.get("overall_priority") or data.get("priority", "LOW")
+
+    send_email_task(
+        citizen_name     = data.get("citizen_name", ""),
+        citizen_email    = data["citizen_email"],
+        report_id        = data["report_id"],
+        total_potholes   = data.get("total_potholes") or data.get("pothole_count", 0),
+        worst_severity   = data.get("worst_severity") or data.get("severity", ""),
+        overall_priority = priority,
+        image_count      = data.get("image_count", 1),
+        location         = data.get("location", ""),
+    )
+
+    return {"status": "success", "message": f"Email sent to {data['citizen_email']}"}
+
+
+
+# --- /test-email ---
+@app.get("/test-email")
+def test_email():
+    """Quick test: open http://localhost:8000/test-email in browser to diagnose email."""
+    result = {}
+    try:
+        server = smtplib.SMTP("smtp.gmail.com", 587, timeout=10)
+        server.ehlo()
+        server.starttls()
+        server.ehlo()
+        result["smtp_connect"] = "ok"
+        server.login(EMAIL_USER, EMAIL_PASS)
+        result["smtp_login"] = "ok"
         msg = EmailMessage()
-        msg['Subject'] = f"Road Damage Complaint Registered – {data['report_id']}"
-        msg['From'] = "YOUR_EMAIL@gmail.com"
-        msg['To'] = data['citizen_email']
-        
-        body = f"""Hello {data['citizen_name'] or 'Citizen'},
-
-Your road damage complaint has been successfully registered.
-
-Report Details:
-Report ID: {data['report_id']}
-Detected Potholes: {data['pothole_count']}
-Highest Severity: {data['severity']}
-Priority Level: {data['priority']}
-
-Thank you for helping improve road infrastructure.
-
-Regards  
-National Road Infrastructure Assessment System
-"""
-        msg.set_content(body)
-
-        server = smtplib.SMTP('smtp.gmail.com', 587)
-        server.starttls() 
-        # TODO: Replace with your actual Gmail and Google App Password
-        server.login("maheshcscl2236@gmail.com", "czcrfhzfgisddild") 
+        msg["Subject"] = "IRDDP Email Test"
+        msg["From"]    = EMAIL_USER
+        msg["To"]      = EMAIL_USER
+        msg.set_content("Test email from IRDDP backend. Email is working!")
         server.send_message(msg)
         server.quit()
-        print(f"Successfully sent REAL confirmation to {data['citizen_email']} for {data['report_id']}")
+        result["status"] = "Email sent successfully to " + EMAIL_USER
+    except smtplib.SMTPAuthenticationError as e:
+        result["smtp_connect"] = "ok"
+        result["smtp_login"]   = f"Auth failed - code {e.smtp_code}: {str(e.smtp_error)}"
+        result["fix"] = "Regenerate App Password at myaccount.google.com -> Security -> App Passwords"
     except Exception as e:
-        print(f"Failed to send automated email via endpoint: {e}")
-        raise HTTPException(status_code=500, detail="Failed to send email")
-    
-    return {"status": "success", "message": "Email sent successfully!"}
+        result["error"] = f"{type(e).__name__}: {e}"
+    result["email_user"]        = EMAIL_USER
+    result["email_pass_length"] = len(EMAIL_PASS)
+    result["email_configured"]  = EMAIL_PASS != "YOUR_APP_PASSWORD_HERE"
+    return result
 
+# ─── /health ──────────────────────────────────────────────────────────
 @app.get("/health")
 def health_check():
-    return {"status": "ok", "model": model_path}
+    # Fix 7: Verify DB is reachable with SELECT 1
+    db_status = "ok"
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.execute("SELECT 1")
+    except Exception as e:
+        db_status = f"error: {e}"
+
+    # Fix 7: Count orphan tmp_ files in uploads/
+    orphan_count = 0
+    try:
+        if os.path.exists("uploads"):
+            orphan_count = sum(
+                1 for f in os.listdir("uploads") if f.startswith("tmp_")
+            )
+    except Exception:
+        pass
+
+    return {
+        "status":            "ok",
+        "model":             model_path,
+        "model_loaded":      app.state.model is not None,
+        "email_user":        EMAIL_USER,
+        "email_configured":  EMAIL_PASS != "YOUR_APP_PASSWORD_HERE",
+        "db_status":         db_status,           # Fix 7
+        "orphan_file_count": orphan_count,        # Fix 7
+    }
+
 
 if __name__ == "__main__":
     import uvicorn
