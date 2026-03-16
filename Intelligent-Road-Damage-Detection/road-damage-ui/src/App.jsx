@@ -7,6 +7,9 @@ import HomePage from "./pages/HomePage";
 import DetectPage from "./pages/DetectPage";
 import ReportPage from "./pages/ReportPage";
 import AboutPage from "./pages/AboutPage";
+import AdminLogin from "./pages/AdminLogin";
+import AdminDashboard from "./pages/AdminDashboard";
+import CitizenTracking from "./pages/CitizenTracking";
 import "./index.css";
 
 export default function App() {
@@ -15,8 +18,15 @@ export default function App() {
   const [fontSize, setFontSize] = useState(16);
   const [screenReader, setScreenReader] = useState(false);
 
+  // Simple auth guard for admin
+  const ProtectedAdmin = ({ children }) => {
+    const token = localStorage.getItem("adminToken");
+    if (!token) return <AdminLogin />;
+    return children;
+  };
+
   return (
-    <BrowserRouter>
+    <BrowserRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
       <div className="app-wrapper">
         <GovHeader
           lang={lang} setLang={setLang}
@@ -31,6 +41,9 @@ export default function App() {
             <Route path="/detect" element={<DetectPage />} />
             <Route path="/report" element={<ReportPage />} />
             <Route path="/about" element={<AboutPage />} />
+            <Route path="/track" element={<CitizenTracking />} />
+            <Route path="/admin/login" element={<AdminLogin />} />
+            <Route path="/admin/dashboard" element={<ProtectedAdmin><AdminDashboard /></ProtectedAdmin>} />
           </Routes>
         </div>
         <GovFooter />

@@ -10,8 +10,9 @@ export default function NavBar({ lang }) {
   const links = [
     { path: "/", label: t.nav_home },
     { path: "/detect", label: t.nav_detect },
-    { path: "/report", label: t.nav_report },
+    { path: "/track", label: t.nav_report },
     { path: "/about", label: t.nav_about },
+    { path: "/admin/login", label: "Admin" },
   ];
 
   return (

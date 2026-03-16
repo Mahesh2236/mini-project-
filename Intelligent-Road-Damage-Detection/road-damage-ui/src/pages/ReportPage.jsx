@@ -95,7 +95,18 @@ export default function ReportPage() {
                 <div className="frc-info-grid">
                   <div className="frc-info-item"><span className="frc-info-label">Name</span><span className="frc-info-value">{report.citizen_name || "—"}</span></div>
                   <div className="frc-info-item"><span className="frc-info-label">Email</span><span className="frc-info-value">{report.citizen_email || "Not provided"}</span></div>
-                  <div className="frc-info-item frc-full"><span className="frc-info-label">Location</span><span className="frc-info-value">{report.location || "—"}</span></div>
+                  <div className="frc-info-item frc-full">
+                    <span className="frc-info-label">Location</span>
+                    <span className="frc-info-value">
+                      {report.location?.address || report.location || "—"}
+                      {report.location?.latitude && (
+                        <div style={{marginTop:"0.4rem", fontSize:"0.8rem", color:"#666", display:"flex", alignItems:"center", gap:"8px"}}>
+                          📍 GPS: {report.location.latitude.toFixed(6)}, {report.location.longitude.toFixed(6)}
+                          <a href={`https://www.openstreetmap.org/?mlat=${report.location.latitude}&mlon=${report.location.longitude}#map=17/${report.location.latitude}/${report.location.longitude}`} target="_blank" rel="noreferrer" style={{color:"#003366", textDecoration:"underline"}}>View on Map</a>
+                        </div>
+                      )}
+                    </span>
+                  </div>
                 </div>
               </div>
               <div className="frc-section">

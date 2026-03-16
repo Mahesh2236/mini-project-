@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import axios from "axios";
 import { printReportAsPDF } from "../utils/reportGenerator";
+import LocationPicker from "../components/LocationPicker";
 
 const API_BASE = "http://localhost:8000";
 
@@ -67,7 +68,9 @@ export default function DetectPage() {
 
   // Form
   const [form, setForm] = useState({
+    title: "", description: "",
     citizen_name: "", citizen_email: "", citizen_phone: "", location: "",
+    latitude: null, longitude: null, address: ""
   });
   const [emailError,  setEmailError]  = useState("");
   const [formErrors,  setFormErrors]  = useState({});
@@ -82,6 +85,13 @@ export default function DetectPage() {
   const [submitError,   setSubmitError]   = useState("");
   const [stepsDone,     setStepsDone]     = useState([]);
   const [submitResult,  setSubmitResult]  = useState(null);
+
+  // OTP state
+  const [otp, setOtp] = useState("");
+  const [otpSent, setOtpSent] = useState(false);
+  const [otpVerified, setOtpVerified] = useState(false);
+  const [otpLoading, setOtpLoading] = useState(false);
+  const [otpError, setOtpError] = useState("");
 
   const fileInputRef = useRef();
   const addMoreRef   = useRef();
@@ -158,6 +168,49 @@ export default function DetectPage() {
     setPreviews(p => p.filter((_, i) => i !== idx));
   };
 
+  // ── OTP Handlers ─────────────────────────────────────────────────
+  const handleSendOtp = async () => {
+    if (!isValidEmail(form.citizen_email)) {
+      setEmailError("Please enter a valid email to receive OTP.");
+      return;
+    }
+    setOtpLoading(true); setOtpError("");
+    try {
+      await axios.post(`${API_BASE}/send-otp`, { email: form.citizen_email });
+      setOtpSent(true);
+    } catch (err) {
+      setOtpError(err.response?.data?.detail || "Failed to send OTP. Try again.");
+    } finally { setOtpLoading(false); }
+  };
+
+  const handleVerifyOtp = async () => {
+    if (otp.length !== 6) {
+      setOtpError("Please enter the 6-digit code.");
+      return;
+    }
+    setOtpLoading(true); setOtpError("");
+    try {
+      await axios.post(`${API_BASE}/verify-otp`, { email: form.citizen_email, otp });
+      setOtpVerified(true);
+    } catch (err) {
+      setOtpError(err.response?.data?.detail || "Invalid code. Please check and try again.");
+    } finally { setOtpLoading(false); }
+  };
+
+  const getCaptchaToken = async () => {
+    return new Promise((resolve) => {
+      const siteKey = "6Le-g4ssAAAAAESvbgGLOgYqXV3FdXp_FQL3xAk9";
+      if (typeof window.grecaptcha === 'undefined') {
+        console.warn("reCAPTCHA not loaded");
+        resolve("dev-token");
+        return;
+      }
+      window.grecaptcha.ready(() => {
+        window.grecaptcha.execute(siteKey, { action: 'submit' }).then(token => resolve(token));
+      });
+    });
+  };
+
   // ── Email validation on blur ─────────────────────────────────────
   const handleEmailBlur = () => {
     if (form.citizen_email && !isValidEmail(form.citizen_email)) {
@@ -173,9 +226,14 @@ export default function DetectPage() {
     if (files.length === 0)            errors.files        = "Please upload or capture at least one road image.";
     if (!form.citizen_name.trim())     errors.citizen_name = "Full name is required.";
     if (!form.location.trim())         errors.location     = "Damage location is required.";
-    if (form.citizen_email && !isValidEmail(form.citizen_email)) {
+    if (!form.citizen_email)           errors.citizen_email = "Email is required for verification.";
+    else if (!isValidEmail(form.citizen_email)) {
       errors.citizen_email = "Please enter a valid email address (e.g. name@gmail.com)";
     }
+    if (!otpVerified)                  errors.citizen_email = "Please verify your email address via OTP.";
+    if (!form.title.trim())            errors.title        = "Complaint title is required.";
+    if (!form.description.trim())      errors.description  = "Description is required.";
+
     setFormErrors(errors);
     return Object.keys(errors).length === 0;
   };
@@ -214,8 +272,13 @@ export default function DetectPage() {
       setEmailError("Please enter a valid email address (e.g. name@gmail.com)");
       return;
     }
-    if (!form.citizen_name.trim() || !form.location.trim()) {
-      setSubmitError("Name and Location are required.");
+    if (!form.citizen_name.trim()) {
+      setSubmitError("Name is required.");
+      return;
+    }
+    if (!form.latitude || !form.longitude) {
+      alert("Please select the complaint location on the map.");
+      setSubmitError("Please select the complaint location on the map.");
       return;
     }
 
@@ -224,6 +287,7 @@ export default function DetectPage() {
     setStepsDone([]);
 
     const summary = analysisData.batch_summary;
+    const captchaToken = await getCaptchaToken();
 
     let submitRes;
     try {
@@ -231,7 +295,13 @@ export default function DetectPage() {
         citizen_name:     form.citizen_name,
         citizen_email:    form.citizen_email || "",
         citizen_phone:    form.citizen_phone || "",
-        location:         form.location,
+        title:            form.title,
+        description:      form.description,
+        location: {
+          latitude:       form.latitude,
+          longitude:      form.longitude,
+          address:        form.address || form.location,
+        },
         image_paths:      analysisData._image_paths,
         processed_paths:  analysisData._processed_paths,
         total_potholes:   summary.total_potholes,
@@ -240,6 +310,7 @@ export default function DetectPage() {
         max_confidence:   summary.max_confidence,
         has_detection:    summary.has_detection,
         total_images:     summary.total_images,
+        captcha_token:    captchaToken,
       });
       submitRes = res.data;
 
@@ -295,7 +366,11 @@ export default function DetectPage() {
     setEmailError(""); setFormErrors({});
     setAnalyzing(false); setSubmitting(false);
     setStep(1);
-    setForm({ citizen_name: "", citizen_email: "", citizen_phone: "", location: gpsAddress || "" });
+    setForm({ 
+      title: "", description: "",
+      citizen_name: "", citizen_email: "", citizen_phone: "", location: gpsAddress || "",
+      latitude: null, longitude: null, address: ""
+    });
     stopCamera(); setCameraActive(false);
   };
 
@@ -409,13 +484,37 @@ export default function DetectPage() {
               {formErrors.files && <div className="field-error" style={{margin:"0.5rem 1rem 0.75rem"}}>⚠️ {formErrors.files}</div>}
             </div>
 
-            {/* Citizen Info */}
+            {/* Citizen & Complaint Info */}
             <div className="form-card">
               <div className="form-card-header">
                 <span className="form-card-icon">👤</span>
-                <span>Citizen Information</span>
+                <span>Complaint Information</span>
               </div>
               <div className="form-grid">
+
+                <div className="form-group">
+                  <label>Complaint Title <span className="required-star">*</span></label>
+                  <input
+                    type="text"
+                    placeholder="e.g. Deep pothole causing traffic"
+                    value={form.title}
+                    className={formErrors.title ? "input-error" : ""}
+                    onChange={e => { setForm({...form, title: e.target.value}); setFormErrors(fe => ({...fe, title: ""})); }}
+                  />
+                  {formErrors.title && <div className="field-error">⚠️ {formErrors.title}</div>}
+                </div>
+
+                <div className="form-group" style={{gridColumn: "1 / -1"}}>
+                  <label>Detailed Description <span className="required-star">*</span></label>
+                  <textarea
+                    placeholder="Describe the condition of the road and the risk it poses..."
+                    value={form.description}
+                    className={formErrors.description ? "input-error" : ""}
+                    onChange={e => { setForm({...form, description: e.target.value}); setFormErrors(fe => ({...fe, description: ""})); }}
+                    style={{width: "100%", padding: "1rem", borderRadius: "10px", border: "1px solid rgba(0,0,0,0.1)", minHeight: "100px", background: "rgba(255,255,255,0.8)"}}
+                  ></textarea>
+                  {formErrors.description && <div className="field-error">⚠️ {formErrors.description}</div>}
+                </div>
 
                 <div className="form-group">
                   <label>Full Name <span className="required-star">*</span></label>
@@ -430,20 +529,44 @@ export default function DetectPage() {
                 </div>
 
                 <div className="form-group">
-                  <label>Email Address <span className="optional-tag">Optional</span></label>
-                  <input
-                    type="email"
-                    placeholder="your@email.com"
-                    value={form.citizen_email}
-                    className={emailError || formErrors.citizen_email ? "input-error" : ""}
-                    onChange={e => { setForm({...form, citizen_email: e.target.value}); setEmailError(""); setFormErrors(fe => ({...fe, citizen_email: ""})); }}
-                    onBlur={handleEmailBlur}
-                  />
-                  {(emailError || formErrors.citizen_email) && (
-                    <div className="field-error">⚠️ {emailError || formErrors.citizen_email}</div>
+                  <label>Email Address <span className="required-star">*</span></label>
+                  <div className="email-input-row" style={{display:"flex", gap:"8px"}}>
+                    <input
+                      type="email"
+                      placeholder="your@email.com"
+                      value={form.citizen_email}
+                      disabled={otpVerified}
+                      className={emailError || formErrors.citizen_email ? "input-error" : ""}
+                      onChange={e => { setForm({...form, citizen_email: e.target.value}); setEmailError(""); setFormErrors(fe => ({...fe, citizen_email: ""})); }}
+                      onBlur={handleEmailBlur}
+                      style={{flex:1}}
+                    />
+                    {!otpVerified && (
+                      <button className="btn-verify-email" onClick={handleSendOtp} disabled={otpLoading || !form.citizen_email}
+                        style={{padding:"0 12px", background:"#003366", color:"#fff", border:"none", borderRadius:"4px", fontSize:"0.8rem", cursor:"pointer"}}>
+                        {otpLoading ? "..." : otpSent ? "Resend" : "Verify"}
+                      </button>
+                    )}
+                    {otpVerified && <span className="verified-badge" style={{color:"#138808", fontWeight:700, fontSize:"0.8rem", display:"flex", alignItems:"center"}}>✅ Verified</span>}
+                  </div>
+
+                  {otpSent && !otpVerified && (
+                    <div className="otp-entry-row" style={{display:"flex", gap:"8px", marginTop:"8px"}}>
+                      <input type="text" maxLength="6" placeholder="6-digit OTP" value={otp} onChange={e => setOtp(e.target.value)}
+                        style={{flex:1, textAlign:"center", letterSpacing:"4px", fontWeight:700}} />
+                      <button className="btn-confirm-otp" onClick={handleVerifyOtp} disabled={otpLoading}
+                        style={{padding:"0 12px", background:"#138808", color:"#fff", border:"none", borderRadius:"4px", fontSize:"0.8rem", cursor:"pointer"}}>
+                        {otpLoading ? "..." : "Confirm Code"}
+                      </button>
+                    </div>
                   )}
-                  {!emailError && !formErrors.citizen_email && (
-                    <span className="form-hint">📧 Confirmation email sent only if provided</span>
+
+                  {otpError && <div className="field-error" style={{color:"#c0392b", fontSize:"0.72rem", marginTop:"4px"}}>⚠️ {otpError}</div>}
+                  {(emailError || formErrors.citizen_email) && (
+                    <div className="field-error" style={{color:"#c0392b", fontSize:"0.72rem", marginTop:"4px"}}>⚠️ {emailError || formErrors.citizen_email}</div>
+                  )}
+                  {!emailError && !formErrors.citizen_email && !otpSent && (
+                    <span className="form-hint" style={{fontSize:"0.7rem", color:"#888"}}>📧 OTP verification required to prevent spam</span>
                   )}
                 </div>
 
@@ -459,17 +582,27 @@ export default function DetectPage() {
 
                 <div className="form-group">
                   <label>
-                    Damage Location <span className="required-star">*</span>
-                    {gpsStatus === "granted" && <span className="gps-auto-tag">📍 GPS</span>}
+                    Precise Damage Location <span className="required-star">*</span>
                   </label>
-                  <input
-                    type="text"
-                    placeholder={tab === "camera" && gpsStatus === "requesting" ? "Getting GPS..." : "e.g. NH-44, Near Nagpur Toll"}
-                    value={form.location}
-                    className={formErrors.location ? "input-error" : ""}
-                    onChange={e => { setForm({...form, location: e.target.value}); setFormErrors(fe => ({...fe, location: ""})); }}
+                  <LocationPicker 
+                    onLocationSelect={(data) => {
+                      setForm(prev => ({
+                        ...prev, 
+                        latitude: data.latitude, 
+                        longitude: data.longitude, 
+                        address: data.address,
+                        location: data.address // Use address as the 'location' text field
+                      }));
+                      setFormErrors(fe => ({...fe, location: ""}));
+                    }} 
                   />
                   {formErrors.location && <div className="field-error">⚠️ {formErrors.location}</div>}
+                </div>
+
+                <div className="security-info-row" style={{marginTop:"8px", textAlign:"right", padding:"0 4px"}}>
+                  <span style={{fontSize:"0.65rem", color:"#888", fontStyle:"italic"}}>
+                    🛡️ This site is protected by reCAPTCHA and the Google <a href="https://policies.google.com/privacy" target="_blank" rel="noreferrer" style={{color:"#888"}}>Privacy Policy</a> and <a href="https://policies.google.com/terms" target="_blank" rel="noreferrer" style={{color:"#888"}}>Terms of Service</a> apply.
+                  </span>
                 </div>
 
               </div>
@@ -478,7 +611,12 @@ export default function DetectPage() {
             {analyzeError && <div className="error-box" style={{marginBottom:"1rem"}}>⚠️ {analyzeError}</div>}
 
             <div className="submit-row">
-              <button className="btn-submit" onClick={handleAnalyze} disabled={analyzing}>
+              <button 
+                className="btn-submit" 
+                onClick={handleAnalyze} 
+                disabled={analyzing || !form.latitude}
+                title={!form.latitude ? "Please select a location on the map first" : ""}
+              >
                 {analyzing
                   ? <><span className="spinner"></span> Analyzing {files.length} image(s)...</>
                   : "🔍 Analyze Images"}
@@ -542,6 +680,24 @@ export default function DetectPage() {
                     value={form.citizen_phone}
                     onChange={e => setForm({...form, citizen_phone: e.target.value})}
                   />
+                </div>
+
+                <div className="form-group">
+                  <label>Complaint Title <span className="required-star">*</span></label>
+                  <input
+                    type="text"
+                    value={form.title}
+                    onChange={e => setForm({...form, title: e.target.value})}
+                  />
+                </div>
+
+                <div className="form-group">
+                  <label>Description <span className="required-star">*</span></label>
+                  <textarea
+                    value={form.description}
+                    onChange={e => setForm({...form, description: e.target.value})}
+                    style={{width: "100%", padding: "0.8rem", borderRadius: "8px", border: "1px solid #ddd", minHeight: "80px"}}
+                  ></textarea>
                 </div>
 
                 <div className="form-group">
@@ -697,16 +853,33 @@ export default function DetectPage() {
             <div className="sb-details">
               {/* Only show email line if email was actually provided */}
               {form.citizen_email && submitResult.email_sent && (
-                <div className="sb-detail-item">✅ Confirmation email sent to <strong>{form.citizen_email}</strong></div>
+               <div className="sb-detail-item">✅ Confirmation email sent to <strong>{form.citizen_email}</strong></div>
+              )}
+              <div className="sb-detail-item">📍 Location: <strong>{submitResult.location?.address || form.address || form.location}</strong></div>
+              {submitResult.location?.latitude && (
+                <div className="sb-detail-item" style={{fontSize:"0.8rem", color:"#666", paddingLeft:"24px"}}>
+                  GPS: {submitResult.location.latitude.toFixed(5)}, {submitResult.location.longitude.toFixed(5)}
+                </div>
               )}
               <div className="sb-detail-item">📄 PDF report has been downloaded to your device</div>
             </div>
             <div className="sb-track-note">
               Track your report anytime at the <strong>Track Report</strong> page using ID: <strong>{submitResult.report_id}</strong>
             </div>
-            <button className="btn-submit" style={{marginTop:"1.5rem", width:"auto", padding:"0.75rem 2rem"}} onClick={handleReset}>
-              ↺ Start New Report
-            </button>
+            <div className="sb-actions" style={{display:"flex", gap:"1rem", justifyContent:"center", marginTop:"1.5rem"}}>
+              <button className="btn-submit" style={{width:"auto", padding:"0.75rem 2rem"}} onClick={handleReset}>
+                ↺ Start New Report
+              </button>
+              <button 
+                className="btn-submit" 
+                style={{width:"auto", padding:"0.75rem 2rem", background:"#003366"}}
+                onClick={() => {
+                  window.location.href = `/track?id=${submitResult.report_id}&email=${form.citizen_email}`;
+                }}
+              >
+                🔍 Track Live Progress
+              </button>
+            </div>
           </div>
         </div>
       )}

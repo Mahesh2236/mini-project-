@@ -129,6 +129,8 @@ body{font-family:'Noto Sans',sans-serif;background:#f5f5f5;color:#1a1a2e}
       <div class="info-cell"><div class="info-label">Email</div><div class="info-value">${citizen?.email||"Not provided"}</div></div>
       <div class="info-cell"><div class="info-label">Phone</div><div class="info-value">${citizen?.phone||"—"}</div></div>
       <div class="info-cell"><div class="info-label">Date &amp; Time</div><div class="info-value">${now}</div></div>
+      <div class="info-cell full"><div class="info-label">Complaint Title</div><div class="info-value" style="font-size:1.1rem">${batchReport?.title||"—"}</div></div>
+      <div class="info-cell full"><div class="info-label">Description</div><div class="info-value">${batchReport?.description||"—"}</div></div>
       <div class="info-cell full"><div class="info-label">Damage Location</div><div class="info-value">${location||"—"}</div></div>
     </div>
   </div>

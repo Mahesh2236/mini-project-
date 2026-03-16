@@ -1,4 +1,4 @@
-import os
+import os # reCAPTCHA reload
 import io
 import uuid
 import json
@@ -8,12 +8,18 @@ from email.message import EmailMessage
 from typing import List, Optional
 from datetime import datetime, timedelta
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, BackgroundTasks, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from ultralytics import YOLO
 from PIL import Image
+import httpx
+import hashlib
+import secrets
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 # Load .env credentials safely
 try:
@@ -23,8 +29,9 @@ except ImportError:
     pass
 
 # ─── Email Config ─────────────────────────────────────────────────────
-EMAIL_USER = os.getenv("EMAIL_USER", "gamehater005@gmail.com")
-EMAIL_PASS = os.getenv("EMAIL_PASS", "YOUR_APP_PASSWORD_HERE")
+EMAIL_USER = os.getenv("EMAIL_USER", "")
+EMAIL_PASS = os.getenv("EMAIL_PASS", "")
+RECAPTCHA_SECRET_KEY = os.getenv("RECAPTCHA_SECRET_KEY", "")
 
 # ─── Fix 1: Orphan Image Cleanup ──────────────────────────────────────
 def cleanup_orphan_images():
@@ -59,7 +66,10 @@ async def lifespan(app: FastAPI):
     yield
 
 # ─── App Setup ────────────────────────────────────────────────────────
-app = FastAPI(title="IRDDP API", version="3.1.0", lifespan=lifespan)
+limiter = Limiter(key_func=get_remote_address)
+app = FastAPI(title="IRDDP API", version="3.2.0", lifespan=lifespan)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,
@@ -71,6 +81,38 @@ app.add_middleware(
 
 os.makedirs("uploads", exist_ok=True)
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+
+# ─── WebSocket Manager ────────────────────────────────────────────────
+class ConnectionManager:
+    def __init__(self):
+        # dictionary: { report_id: [websocket1, websocket2, ...] }
+        self.active_connections: dict[str, List[WebSocket]] = {}
+
+    async def connect(self, websocket: WebSocket, report_id: str):
+        await websocket.accept()
+        if report_id not in self.active_connections:
+            self.active_connections[report_id] = []
+        self.active_connections[report_id].append(websocket)
+        print(f"[WS] Connected tracker for {report_id}. Total: {len(self.active_connections[report_id])}")
+
+    def disconnect(self, websocket: WebSocket, report_id: str):
+        if report_id in self.active_connections:
+            self.active_connections[report_id].remove(websocket)
+            if not self.active_connections[report_id]:
+                del self.active_connections[report_id]
+        print(f"[WS] Disconnected tracker for {report_id}")
+
+    async def broadcast_status(self, report_id: str, message: dict):
+        if report_id in self.active_connections:
+            # Create a copy of the list to avoid "size changed during iteration" errors
+            for connection in list(self.active_connections[report_id]):
+                try:
+                    await connection.send_json(message)
+                except Exception as e:
+                    print(f"[WS] Send error to tracker: {e}")
+                    self.disconnect(connection, report_id)
+
+manager = ConnectionManager()
 
 # ─── Database ─────────────────────────────────────────────────────────
 DB_FILE = "reports.db"
@@ -94,8 +136,39 @@ def init_db():
                 image_count           INTEGER DEFAULT 1,
                 image_paths           TEXT,
                 processed_image_paths TEXT,
-                status                TEXT DEFAULT 'OPEN',
-                created_at            TEXT
+                status                TEXT DEFAULT 'Pending',
+                admin_note            TEXT DEFAULT '',
+                latitude              REAL,
+                longitude             REAL,
+                address               TEXT,
+                title                 TEXT,
+                description           TEXT,
+                created_at            TEXT,
+                updated_at            TEXT
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS admins (
+                id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE,
+                password TEXT, -- In production, use hashed passwords
+                name     TEXT
+            )
+        ''')
+        # Seed default admin if none exists (for dev convenience)
+        cursor.execute("SELECT count(*) FROM admins")
+        if cursor.fetchone()[0] == 0:
+            cursor.execute("INSERT INTO admins (username, password, name) VALUES (?, ?, ?)", 
+                           ("admin", "admin123", "Road Authority Admin"))
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS otp_verifications (
+                email      TEXT PRIMARY KEY,
+                otp_hash   TEXT,
+                otp_code   TEXT, -- For dev/debug if needed, but we'll use hash in production
+                expires_at TEXT,
+                verified   INTEGER DEFAULT 0,
+                updated_at TEXT
             )
         ''')
         migrations = [
@@ -106,12 +179,21 @@ def init_db():
             "ALTER TABLE reports ADD COLUMN image_count INTEGER DEFAULT 1",
             "ALTER TABLE reports ADD COLUMN image_paths TEXT",
             "ALTER TABLE reports ADD COLUMN processed_image_paths TEXT",
+            "ALTER TABLE reports ADD COLUMN admin_note TEXT DEFAULT ''",
+            "ALTER TABLE reports ADD COLUMN updated_at TEXT",
+            "ALTER TABLE reports ADD COLUMN latitude REAL",
+            "ALTER TABLE reports ADD COLUMN longitude REAL",
+            "ALTER TABLE reports ADD COLUMN address TEXT",
+            "ALTER TABLE reports ADD COLUMN title TEXT",
+            "ALTER TABLE reports ADD COLUMN description TEXT",
         ]
         for sql in migrations:
             try:
                 cursor.execute(sql)
             except sqlite3.OperationalError:
                 pass
+        # Update status to Pending if it was OPEN (compat with previous versions)
+        cursor.execute("UPDATE reports SET status = 'Pending' WHERE status = 'OPEN'")
 
 def save_report_to_db(data: dict):
     try:
@@ -122,8 +204,9 @@ def save_report_to_db(data: dict):
                 INSERT INTO reports (
                     report_id, citizen_name, citizen_email, citizen_phone, location,
                     total_potholes, worst_severity, overall_priority, max_confidence,
-                    image_count, image_paths, processed_image_paths, status, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    image_count, image_paths, processed_image_paths, status,
+                    latitude, longitude, address, title, description, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 data.get("report_id"),
                 data.get("citizen_name", ""),
@@ -137,7 +220,12 @@ def save_report_to_db(data: dict):
                 data.get("image_count", 1),
                 json.dumps(data.get("image_paths", [])),
                 json.dumps(data.get("processed_image_paths", [])),
-                data.get("status", "OPEN"),
+                data.get("status", "Pending"),
+                data.get("latitude"),
+                data.get("longitude"),
+                data.get("address", ""),
+                data.get("title", ""),
+                data.get("description", ""),
                 data.get("created_at", datetime.now().isoformat()),
             ))
         print(f"[DB] ✅ Saved report {data.get('report_id')}")
@@ -255,6 +343,61 @@ VI Semester Capstone Project — CSE
         print(f"[Email]    EMAIL_PASS length={len(EMAIL_PASS)} chars (should be 16)")
     except Exception as e:
         print(f"[Email] ❌ Failed ({type(e).__name__}): {e}")
+
+# ─── OTP Helpers ──────────────────────────────────────────────────────
+def send_otp_email(email: str, otp: str):
+    msg = EmailMessage()
+    msg["Subject"] = f"Verification Code — {otp}"
+    msg["From"]    = EMAIL_USER
+    msg["To"]      = email
+
+    body = f"""Your verification code is: {otp}
+
+This code will expire in 5 minutes.
+If you did not request this code, please ignore this email.
+
+Regards,
+IRDDP Security Team
+"""
+    msg.set_content(body)
+
+    try:
+        server = smtplib.SMTP("smtp.gmail.com", 587)
+        server.ehlo()
+        server.starttls()
+        server.ehlo()
+        server.login(EMAIL_USER, EMAIL_PASS)
+        server.send_message(msg)
+        server.quit()
+        print(f"[OTP] ✅ Sent to {email}")
+        return True
+    except Exception as e:
+        print(f"[OTP] ❌ Failed to send to {email}: {e}")
+        return False
+
+async def verify_recaptcha(token: str):
+    if RECAPTCHA_SECRET_KEY == "YOUR_RECAPTCHA_SECRET_HERE":
+        print("[reCAPTCHA] ⚠️ Secret Key not configured. Skipping verification (DEV MODE).")
+        return 1.0
+
+    async with httpx.AsyncClient() as client:
+        try:
+            res = await client.post(
+                "https://www.google.com/recaptcha/api/siteverify",
+                data={
+                    "secret": RECAPTCHA_SECRET_KEY,
+                    "response": token
+                },
+                timeout=10.0
+            )
+            data = res.json()
+            if not data.get("success"):
+                print(f"[reCAPTCHA] ❌ Verification failed: {data.get('error-codes')}")
+                return 0.0
+            return data.get("score", 0.0)
+        except Exception as e:
+            print(f"[reCAPTCHA] ❌ API Error: {e}")
+            return 0.0
 
 # --- Priority Helpers ---
 PRIORITY_ORDER = ["LOW", "MEDIUM", "HIGH", "CRITICAL"]
@@ -526,11 +669,18 @@ async def analyze_images(
 
 
 # ─── /submit — Official confirmation: DB + Email + Report ID ──────────
+class LocationDetail(BaseModel):
+    latitude:  float
+    longitude: float
+    address:   Optional[str] = ""
+
 class SubmitRequest(BaseModel):
     citizen_name:     str
-    citizen_email:    Optional[str] = ""
+    citizen_email:    str
     citizen_phone:    Optional[str] = ""
-    location:         str
+    title:            Optional[str] = ""
+    description:      Optional[str] = ""
+    location_text:    Optional[str] = "" # renaming from 'location' string to avoid conflict
     image_paths:      List[str]
     processed_paths:  List[str]
     total_potholes:   int
@@ -539,15 +689,42 @@ class SubmitRequest(BaseModel):
     max_confidence:   str
     has_detection:    bool
     total_images:     int
+    captcha_token:    str
+    location:         LocationDetail
 
 @app.post("/submit")
-async def submit_report(payload: SubmitRequest, background_tasks: BackgroundTasks):
+@limiter.limit("10/hour")
+async def submit_report(request: Request, payload: SubmitRequest, background_tasks: BackgroundTasks):
     """
     Phase 2: Citizen has reviewed and confirmed.
     Fix 1: Renames tmp_ images to permanent names.
     Fix 2: Uses uuid4 for collision-proof Report IDs.
     Fix 5: DB operations use context manager.
     """
+    # ── Security Checks ─────────────────────────────────────────────
+    # 1. Verify OTP
+    # 1. Verify OTP
+    if not payload.citizen_email or "@" not in payload.citizen_email:
+        raise HTTPException(status_code=400, detail="A valid email is required for verification.")
+
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        # Ensure we check the LATEST verification status for this email
+        cursor.execute("SELECT verified FROM otp_verifications WHERE email = ? ORDER BY updated_at DESC LIMIT 1", (payload.citizen_email,))
+        row = cursor.fetchone()
+        if not row or not row["verified"]:
+            raise HTTPException(status_code=403, detail="Email not verified. Please verify your email first via OTP.")
+
+    # 2. Verify reCAPTCHA
+    score = await verify_recaptcha(payload.captcha_token)
+    if score < 0.5:
+        raise HTTPException(
+            status_code=400,
+            detail=f"reCAPTCHA verification failed (Score: {score:.1f}). Lower score indicates potential bot."
+        )
+
+    # ── Process Submission ──────────────────────────────────────────
     # Fix 2: UUID-based report ID — no collision risk, no silent overwrites
     uid       = uuid.uuid4().hex[:8].upper()
     report_id = f"RD-{datetime.now().year}-{uid}"
@@ -611,7 +788,12 @@ async def submit_report(payload: SubmitRequest, background_tasks: BackgroundTask
         "citizen_name":          payload.citizen_name,
         "citizen_email":         payload.citizen_email,
         "citizen_phone":         payload.citizen_phone,
-        "location":              payload.location,
+        "title":                 payload.title,
+        "description":           payload.description,
+        "location":              payload.location.address,
+        "latitude":              payload.location.latitude,
+        "longitude":             payload.location.longitude,
+        "address":               payload.location.address,
         "total_potholes":        payload.total_potholes,
         "worst_severity":        payload.worst_severity,
         "overall_priority":      payload.overall_priority,
@@ -619,7 +801,7 @@ async def submit_report(payload: SubmitRequest, background_tasks: BackgroundTask
         "image_count":           payload.total_images,
         "image_paths":           permanent_image_paths,
         "processed_image_paths": permanent_processed_paths,
-        "status":                "OPEN",
+        "status":                "Pending",
         "created_at":            created_at,
     })
 
@@ -633,17 +815,22 @@ async def submit_report(payload: SubmitRequest, background_tasks: BackgroundTask
             payload.worst_severity,
             payload.overall_priority,
             payload.total_images,
-            payload.location,
+            payload.location.address,
         )
 
     return {
         "report_id":               report_id,
         "created_at":              created_at,
-        "status":                  "OPEN",
+        "status":                  "Pending",
         "email_sent":              bool(payload.citizen_email and "@" in payload.citizen_email),
         # Return permanent paths so frontend can update image URLs (fixes 404 after rename)
         "permanent_image_paths":     permanent_image_paths,
         "permanent_processed_paths": permanent_processed_paths,
+        "location": {
+            "latitude":  payload.location.latitude,
+            "longitude": payload.location.longitude,
+            "address":   payload.location.address,
+        }
     }
 
 
@@ -685,7 +872,11 @@ def get_report(report_id: str):
         "citizen_name":        data.get("citizen_name", ""),
         "citizen_email":       data.get("citizen_email", ""),
         "citizen_phone":       data.get("citizen_phone", ""),
-        "location":            data.get("location", ""),
+        "location": {
+            "latitude":        data.get("latitude"),
+            "longitude":       data.get("longitude"),
+            "address":         data.get("address") or data.get("location", ""),
+        },
         "detected_potholes":   data.get("total_potholes") or data.get("pothole_count", 0),
         "highest_severity":    data.get("worst_severity") or data.get("severity", ""),
         "priority_level":      priority,
@@ -734,6 +925,68 @@ def resend_email(report_id: str):
     return {"status": "success", "message": f"Email sent to {data['citizen_email']}"}
 
 
+# ─── OTP Endpoints ────────────────────────────────────────────────────
+class OtpRequest(BaseModel):
+    email: str
+
+@app.post("/send-otp")
+@limiter.limit("5/minute")
+async def send_otp(request: Request, payload: OtpRequest):
+    email = payload.email
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="Invalid email address")
+
+    otp = "".join([str(secrets.randbelow(10)) for _ in range(6)])
+    otp_hash = hashlib.sha256(otp.encode()).hexdigest()
+    expires_at = (datetime.now() + timedelta(minutes=5)).isoformat()
+
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO otp_verifications (email, otp_hash, otp_code, expires_at, verified, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (email, otp_hash, otp, expires_at, 0, datetime.now().isoformat()))
+
+    success = send_otp_email(email, otp)
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to send OTP. Please check backend logs.")
+
+    return {"status": "success", "message": "OTP sent successfully"}
+
+class VerifyRequest(BaseModel):
+    email: str
+    otp: str
+
+@app.post("/verify-otp")
+@limiter.limit("10/minute")
+async def verify_otp(request: Request, payload: VerifyRequest):
+    email = payload.email
+    otp = payload.otp
+
+    if not email or not otp:
+        raise HTTPException(status_code=400, detail="Email and OTP are required")
+
+    otp_hash = hashlib.sha256(otp.encode()).hexdigest()
+    now = datetime.now().isoformat()
+
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT * FROM otp_verifications WHERE email = ? AND otp_hash = ? AND expires_at > ?
+        ''', (email, otp_hash, now))
+        row = cursor.fetchone()
+
+        if not row:
+            raise HTTPException(status_code=400, detail="Invalid or expired OTP")
+
+        cursor.execute('''
+            UPDATE otp_verifications SET verified = 1, updated_at = ? WHERE email = ?
+        ''', (now, email))
+
+    return {"status": "success", "message": "Email verified successfully"}
+
+
 
 # --- /test-email ---
 @app.get("/test-email")
@@ -766,6 +1019,153 @@ def test_email():
     result["email_pass_length"] = len(EMAIL_PASS)
     result["email_configured"]  = EMAIL_PASS != "YOUR_APP_PASSWORD_HERE"
     return result
+
+
+# ─── Admin Dashboard Endpoints ─────────────────────────────────────────
+
+class AdminLoginRequest(BaseModel):
+    username: str
+    password: str
+
+@app.post("/admin/login")
+async def admin_login(payload: AdminLoginRequest):
+    # Simple hardcoded/DB-based check for authority login
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM admins WHERE username = ? AND password = ?", (payload.username, payload.password))
+        admin = cursor.fetchone()
+        if not admin:
+            raise HTTPException(status_code=401, detail="Invalid admin credentials")
+        return {"status": "success", "token": "mock-admin-token", "name": admin["name"]}
+
+@app.get("/admin/stats")
+async def get_admin_stats():
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT count(*) as total FROM reports")
+        total = cursor.fetchone()["total"]
+        cursor.execute("SELECT count(*) as pending FROM reports WHERE status = 'Pending'")
+        pending = cursor.fetchone()["pending"]
+        cursor.execute("SELECT count(*) as review FROM reports WHERE status = 'Under Review'")
+        review = cursor.fetchone()["review"]
+        cursor.execute("SELECT count(*) as resolved FROM reports WHERE status = 'Resolved'")
+        resolved = cursor.fetchone()["resolved"]
+        cursor.execute("SELECT count(*) as rejected FROM reports WHERE status = 'Rejected'")
+        rejected = cursor.fetchone()["rejected"]
+        
+        return {
+            "total": total,
+            "pending": pending,
+            "under_review": review,
+            "resolved": resolved,
+            "rejected": rejected
+        }
+
+@app.get("/admin/reports")
+async def get_admin_reports():
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM reports ORDER BY created_at DESC")
+        reports = [dict(row) for row in cursor.fetchall()]
+        # Convert JSON strings back to lists
+        for r in reports:
+            try:
+                r["image_paths"] = json.loads(r["image_paths"])
+                r["processed_image_paths"] = json.loads(r["processed_image_paths"])
+            except:
+                r["image_paths"] = []
+                r["processed_image_paths"] = []
+            
+            # Nest location for consistency
+            r["location"] = {
+                "latitude":  r.get("latitude"),
+                "longitude": r.get("longitude"),
+                "address":   r.get("address") or r.get("location", ""),
+            }
+        return reports
+
+class AdminUpdateRequest(BaseModel):
+    status: str
+    admin_note: Optional[str] = ""
+
+@app.patch("/admin/reports/{report_id}")
+async def update_report_status(report_id: str, payload: AdminUpdateRequest):
+    now = datetime.now().isoformat()
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE reports 
+            SET status = ?, admin_note = ?, updated_at = ?
+            WHERE report_id = ?
+        ''', (payload.status, payload.admin_note, now, report_id))
+        if conn.total_changes == 0:
+            raise HTTPException(status_code=404, detail="Report not found")
+        
+    # Real-time Broadcast via WebSocket
+    await manager.broadcast_status(report_id, {
+        "status": payload.status,
+        "admin_note": payload.admin_note,
+        "updated_at": now
+    })
+    
+    return {"status": "success", "updated_at": now}
+
+@app.delete("/admin/reports/{report_id}")
+async def delete_report(report_id: str):
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM reports WHERE report_id = ?", (report_id,))
+        if conn.total_changes == 0:
+            raise HTTPException(status_code=404, detail="Report not found")
+            
+    # Also notify via WebSocket so it disappears for anyone watching?
+    # Or just return success.
+    return {"status": "success", "message": f"Report {report_id} deleted"}
+
+# ─── Citizen Tracking Endpoints ────────────────────────────────────────
+
+@app.get("/track/{report_id}")
+async def track_report(report_id: str, email: str):
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM reports WHERE report_id = ? AND citizen_email = ?", (report_id, email))
+        report = cursor.fetchone()
+        if not report:
+            raise HTTPException(status_code=404, detail="Report not found or email mismatch")
+        
+        report_dict = dict(report)
+        try:
+            report_dict["image_paths"] = json.loads(report_dict["image_paths"])
+            report_dict["processed_image_paths"] = json.loads(report_dict["processed_image_paths"])
+        except:
+            report_dict["image_paths"] = []
+            report_dict["processed_image_paths"] = []
+            
+        # Nest location for consistency
+        report_dict["location"] = {
+            "latitude":  report_dict.get("latitude"),
+            "longitude": report_dict.get("longitude"),
+            "address":   report_dict.get("address") or report_dict.get("location", ""),
+        }
+            
+        return report_dict
+
+@app.websocket("/ws/track/{report_id}")
+async def websocket_endpoint(websocket: WebSocket, report_id: str):
+    await manager.connect(websocket, report_id)
+    try:
+        while True:
+            # We don't expect messages from client, but we must keep it open
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        manager.disconnect(websocket, report_id)
+    except Exception as e:
+        print(f"[WS] Error: {e}")
+        manager.disconnect(websocket, report_id)
 
 # ─── /health ──────────────────────────────────────────────────────────
 @app.get("/health")
