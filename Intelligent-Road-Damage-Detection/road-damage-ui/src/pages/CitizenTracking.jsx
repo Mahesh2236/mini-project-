@@ -154,7 +154,6 @@ export default function CitizenTracking() {
 
             <div className="status-hero">
               <span className="report-id-tag">{report.report_id}</span>
-              <h2 style={{fontSize:"1.4rem", color:"#003366", marginBottom:"0.5rem"}}>{report.title}</h2>
               <h1>{report.status}</h1>
               <p className="location-text">📍 {report.location?.address || (typeof report.location === 'string' ? report.location : "") || "N/A"}</p>
               {report.location?.latitude && (

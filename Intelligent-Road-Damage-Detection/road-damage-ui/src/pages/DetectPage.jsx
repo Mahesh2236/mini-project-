@@ -68,7 +68,6 @@ export default function DetectPage() {
 
   // Form
   const [form, setForm] = useState({
-    title: "", description: "",
     citizen_name: "", citizen_email: "", citizen_phone: "", location: "",
     latitude: null, longitude: null, address: ""
   });
@@ -231,8 +230,6 @@ export default function DetectPage() {
       errors.citizen_email = "Please enter a valid email address (e.g. name@gmail.com)";
     }
     if (!otpVerified)                  errors.citizen_email = "Please verify your email address via OTP.";
-    if (!form.title.trim())            errors.title        = "Complaint title is required.";
-    if (!form.description.trim())      errors.description  = "Description is required.";
 
     setFormErrors(errors);
     return Object.keys(errors).length === 0;
@@ -295,8 +292,6 @@ export default function DetectPage() {
         citizen_name:     form.citizen_name,
         citizen_email:    form.citizen_email || "",
         citizen_phone:    form.citizen_phone || "",
-        title:            form.title,
-        description:      form.description,
         location: {
           latitude:       form.latitude,
           longitude:      form.longitude,
@@ -367,7 +362,6 @@ export default function DetectPage() {
     setAnalyzing(false); setSubmitting(false);
     setStep(1);
     setForm({ 
-      title: "", description: "",
       citizen_name: "", citizen_email: "", citizen_phone: "", location: gpsAddress || "",
       latitude: null, longitude: null, address: ""
     });
@@ -492,29 +486,6 @@ export default function DetectPage() {
               </div>
               <div className="form-grid">
 
-                <div className="form-group">
-                  <label>Complaint Title <span className="required-star">*</span></label>
-                  <input
-                    type="text"
-                    placeholder="e.g. Deep pothole causing traffic"
-                    value={form.title}
-                    className={formErrors.title ? "input-error" : ""}
-                    onChange={e => { setForm({...form, title: e.target.value}); setFormErrors(fe => ({...fe, title: ""})); }}
-                  />
-                  {formErrors.title && <div className="field-error">⚠️ {formErrors.title}</div>}
-                </div>
-
-                <div className="form-group" style={{gridColumn: "1 / -1"}}>
-                  <label>Detailed Description <span className="required-star">*</span></label>
-                  <textarea
-                    placeholder="Describe the condition of the road and the risk it poses..."
-                    value={form.description}
-                    className={formErrors.description ? "input-error" : ""}
-                    onChange={e => { setForm({...form, description: e.target.value}); setFormErrors(fe => ({...fe, description: ""})); }}
-                    style={{width: "100%", padding: "1rem", borderRadius: "10px", border: "1px solid rgba(0,0,0,0.1)", minHeight: "100px", background: "rgba(255,255,255,0.8)"}}
-                  ></textarea>
-                  {formErrors.description && <div className="field-error">⚠️ {formErrors.description}</div>}
-                </div>
 
                 <div className="form-group">
                   <label>Full Name <span className="required-star">*</span></label>
@@ -682,23 +653,6 @@ export default function DetectPage() {
                   />
                 </div>
 
-                <div className="form-group">
-                  <label>Complaint Title <span className="required-star">*</span></label>
-                  <input
-                    type="text"
-                    value={form.title}
-                    onChange={e => setForm({...form, title: e.target.value})}
-                  />
-                </div>
-
-                <div className="form-group">
-                  <label>Description <span className="required-star">*</span></label>
-                  <textarea
-                    value={form.description}
-                    onChange={e => setForm({...form, description: e.target.value})}
-                    style={{width: "100%", padding: "0.8rem", borderRadius: "8px", border: "1px solid #ddd", minHeight: "80px"}}
-                  ></textarea>
-                </div>
 
                 <div className="form-group">
                   <label>Damage Location <span className="required-star">*</span></label>

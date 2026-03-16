@@ -175,14 +175,6 @@ export default function AdminDashboard() {
               <div className="detail-grid">
                 <div className="detail-info">
                   <div className="info-item">
-                    <label>Complaint Subject:</label>
-                    <p style={{fontSize:"1.1rem", fontWeight:700, color:"#003366"}}>{selectedReport.title || "No Title"}</p>
-                  </div>
-                  <div className="info-item">
-                    <label>Description:</label>
-                    <p style={{background:"#f5f5f5", padding:"1rem", borderRadius:"8px", fontSize:"0.9rem"}}>{selectedReport.description || "No description provided."}</p>
-                  </div>
-                  <div className="info-item" style={{borderTop:"1px solid #eee", paddingTop:"1rem", marginTop:"1rem"}}>
                     <label>Citizen:</label>
                     <p>{selectedReport.citizen_name} ({selectedReport.citizen_email})</p>
                   </div>

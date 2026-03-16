@@ -205,8 +205,8 @@ def save_report_to_db(data: dict):
                     report_id, citizen_name, citizen_email, citizen_phone, location,
                     total_potholes, worst_severity, overall_priority, max_confidence,
                     image_count, image_paths, processed_image_paths, status,
-                    latitude, longitude, address, title, description, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    latitude, longitude, address, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 data.get("report_id"),
                 data.get("citizen_name", ""),
@@ -224,8 +224,6 @@ def save_report_to_db(data: dict):
                 data.get("latitude"),
                 data.get("longitude"),
                 data.get("address", ""),
-                data.get("title", ""),
-                data.get("description", ""),
                 data.get("created_at", datetime.now().isoformat()),
             ))
         print(f"[DB] ✅ Saved report {data.get('report_id')}")
@@ -678,8 +676,6 @@ class SubmitRequest(BaseModel):
     citizen_name:     str
     citizen_email:    str
     citizen_phone:    Optional[str] = ""
-    title:            Optional[str] = ""
-    description:      Optional[str] = ""
     location_text:    Optional[str] = "" # renaming from 'location' string to avoid conflict
     image_paths:      List[str]
     processed_paths:  List[str]
@@ -788,8 +784,6 @@ async def submit_report(request: Request, payload: SubmitRequest, background_tas
         "citizen_name":          payload.citizen_name,
         "citizen_email":         payload.citizen_email,
         "citizen_phone":         payload.citizen_phone,
-        "title":                 payload.title,
-        "description":           payload.description,
         "location":              payload.location.address,
         "latitude":              payload.location.latitude,
         "longitude":             payload.location.longitude,
