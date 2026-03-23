@@ -3,7 +3,7 @@ import axios from "axios";
 import { printReportAsPDF } from "../utils/reportGenerator";
 import LocationPicker from "../components/LocationPicker";
 
-const API_BASE = "http://localhost:8000";
+const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8000";
 
 const PRIORITY_CONFIG = {
   LOW:      { color: "#27ae60", bg: "#eafaf1", border: "#a9dfbf", icon: "👁️" },
