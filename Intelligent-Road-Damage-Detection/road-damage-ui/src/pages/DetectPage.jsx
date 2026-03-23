@@ -154,6 +154,31 @@ export default function DetectPage() {
 
   useEffect(() => { if (tab !== "camera") stopCamera(); return () => stopCamera(); }, [tab]);
 
+  // ── Explicitly render reCAPTCHA v2 when reaching Step 2 ───────────
+  useEffect(() => {
+    if (step === 2 && window.grecaptcha) {
+      const renderCaptcha = () => {
+        try {
+          const container = document.querySelector('.g-recaptcha');
+          if (container && container.innerHTML === "") {
+            window.grecaptcha.render(container, {
+              'sitekey': '6Le-g4ssAAAAAESvbgGLOgYqXV3FdXp_FQL3xAk9'
+            });
+          }
+        } catch (e) {
+          console.warn("reCAPTCHA render error:", e);
+        }
+      };
+      
+      if (window.grecaptcha.render) {
+        // Short delay to ensure DOM is updated
+        setTimeout(renderCaptcha, 100);
+      } else {
+        window.grecaptcha.ready(renderCaptcha);
+      }
+    }
+  }, [step]);
+
   // ── File Upload ──────────────────────────────────────────────────
   const addFiles = (newFiles) => {
     const arr = Array.from(newFiles);
@@ -196,18 +221,13 @@ export default function DetectPage() {
     } finally { setOtpLoading(false); }
   };
 
-  const getCaptchaToken = async () => {
-    return new Promise((resolve) => {
-      const siteKey = "6Le-g4ssAAAAAESvbgGLOgYqXV3FdXp_FQL3xAk9";
-      if (typeof window.grecaptcha === 'undefined') {
-        console.warn("reCAPTCHA not loaded");
-        resolve("dev-token");
-        return;
-      }
-      window.grecaptcha.ready(() => {
-        window.grecaptcha.execute(siteKey, { action: 'submit' }).then(token => resolve(token));
-      });
-    });
+  const getCaptchaToken = () => {
+    if (typeof window.grecaptcha === 'undefined') {
+      console.warn("reCAPTCHA not loaded");
+      return "dev-token";
+    }
+    const response = window.grecaptcha.getResponse();
+    return response || "dev-token"; // Fallback to dev-token if not checked (backend will handle validation)
   };
 
   // ── Email validation on blur ─────────────────────────────────────
@@ -585,8 +605,8 @@ export default function DetectPage() {
               <button 
                 className="btn-submit" 
                 onClick={handleAnalyze} 
-                disabled={analyzing || !form.latitude}
-                title={!form.latitude ? "Please select a location on the map first" : ""}
+                disabled={analyzing || !form.latitude || !otpVerified}
+                title={!form.latitude ? "Please select a location on the map first" : !otpVerified ? "Please verify your email via OTP" : ""}
               >
                 {analyzing
                   ? <><span className="spinner"></span> Analyzing {files.length} image(s)...</>
@@ -686,6 +706,16 @@ export default function DetectPage() {
             </div>
 
             {submitError && <div className="error-box" style={{marginBottom:"1rem"}}>⚠️ {submitError}</div>}
+
+            {/* reCAPTCHA v2 Widget */}
+            {!submitting && (
+              <div className="captcha-container" style={{ marginBottom: "1.5rem", display: "flex", justifyContent: "center" }}>
+                <div 
+                  className="g-recaptcha" 
+                  data-sitekey="6Le-g4ssAAAAAESvbgGLOgYqXV3FdXp_FQL3xAk9"
+                ></div>
+              </div>
+            )}
 
             {/* Submit button */}
             {!submitting && (

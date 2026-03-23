@@ -165,7 +165,7 @@ def init_db():
             CREATE TABLE IF NOT EXISTS otp_verifications (
                 email      TEXT PRIMARY KEY,
                 otp_hash   TEXT,
-                otp_code   TEXT, -- For dev/debug if needed, but we'll use hash in production
+                otp_code   TEXT,
                 expires_at TEXT,
                 verified   INTEGER DEFAULT 0,
                 updated_at TEXT
@@ -392,7 +392,8 @@ async def verify_recaptcha(token: str):
             if not data.get("success"):
                 print(f"[reCAPTCHA] ❌ Verification failed: {data.get('error-codes')}")
                 return 0.0
-            return data.get("score", 0.0)
+            # For v2, 'score' is not present. Default to 1.0 if success is True.
+            return data.get("score", 1.0)
         except Exception as e:
             print(f"[reCAPTCHA] ❌ API Error: {e}")
             return 0.0
@@ -481,7 +482,10 @@ def find_best_model():
                     return p
         except Exception:
             pass
-    return "best.pt"
+    # Finally check root directory
+    if os.path.exists("best.pt"):
+        return "best.pt"
+    return "yolov8n.pt"
 
 model_path = find_best_model()
 print(f"[Model] Loading from: {model_path}")
@@ -558,7 +562,7 @@ async def analyze_images(
             if boxes is not None:
                 for box in boxes:
                     confidence = float(box.conf[0])
-                    if confidence < 0.6:
+                    if confidence < 0.4:
                         continue
                     if confidence > max_conf:
                         max_conf = confidence
@@ -698,7 +702,6 @@ async def submit_report(request: Request, payload: SubmitRequest, background_tas
     Fix 5: DB operations use context manager.
     """
     # ── Security Checks ─────────────────────────────────────────────
-    # 1. Verify OTP
     # 1. Verify OTP
     if not payload.citizen_email or "@" not in payload.citizen_email:
         raise HTTPException(status_code=400, detail="A valid email is required for verification.")
