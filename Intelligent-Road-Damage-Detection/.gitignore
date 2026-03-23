@@ -3,3 +3,8 @@ __pycache__/
 dataset/
 runs/
 *.pt
+node_modules/
+dist/
+.env
+reports.db
+uploads/

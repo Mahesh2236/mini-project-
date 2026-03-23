@@ -1,7 +1,7 @@
 import { useState } from "react";
 import axios from "axios";
 
-const API_BASE = "http://localhost:8000";
+const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8000";
 const PRIORITY_CONFIG = {
   LOW:      { color: "#27ae60", bg: "#eafaf1", icon: "👁️" },
   MEDIUM:   { color: "#f39c12", bg: "#fefae6", icon: "🔧" },

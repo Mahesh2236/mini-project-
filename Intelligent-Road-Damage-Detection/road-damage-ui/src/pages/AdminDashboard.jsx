@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import axios from "axios";
 
-const API_BASE_URL = "http://localhost:8000";
+const API_BASE_URL = import.meta.env.VITE_API_BASE || "http://localhost:8000";
 
 export default function AdminDashboard() {
   const [stats, setStats] = useState({ total: 0, pending: 0, under_review: 0, resolved: 0 });

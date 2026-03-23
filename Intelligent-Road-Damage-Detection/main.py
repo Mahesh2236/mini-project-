@@ -715,13 +715,13 @@ async def submit_report(request: Request, payload: SubmitRequest, background_tas
         if not row or not row["verified"]:
             raise HTTPException(status_code=403, detail="Email not verified. Please verify your email first via OTP.")
 
-    # 2. Verify reCAPTCHA
-    score = await verify_recaptcha(payload.captcha_token)
-    if score < 0.5:
-        raise HTTPException(
-            status_code=400,
-            detail=f"reCAPTCHA verification failed (Score: {score:.1f}). Lower score indicates potential bot."
-        )
+    # 2. Verify reCAPTCHA (Disabled for hosting)
+    # score = await verify_recaptcha(payload.captcha_token)
+    # if score < 0.5:
+    #     raise HTTPException(
+    #         status_code=400,
+    #         detail=f"reCAPTCHA verification failed (Score: {score:.1f}). Lower score indicates potential bot."
+    #     )
 
     # ── Process Submission ──────────────────────────────────────────
     # Fix 2: UUID-based report ID — no collision risk, no silent overwrites
