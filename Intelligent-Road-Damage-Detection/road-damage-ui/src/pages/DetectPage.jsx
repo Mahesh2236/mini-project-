@@ -222,12 +222,7 @@ export default function DetectPage() {
   };
 
   const getCaptchaToken = () => {
-    if (typeof window.grecaptcha === 'undefined') {
-      console.warn("reCAPTCHA not loaded");
-      return "dev-token";
-    }
-    const response = window.grecaptcha.getResponse();
-    return response || "dev-token"; // Fallback to dev-token if not checked (backend will handle validation)
+    return "disabled"; // reCAPTCHA disabled per user request
   };
 
   // ── Email validation on blur ─────────────────────────────────────
@@ -707,15 +702,7 @@ export default function DetectPage() {
 
             {submitError && <div className="error-box" style={{marginBottom:"1rem"}}>⚠️ {submitError}</div>}
 
-            {/* reCAPTCHA v2 Widget */}
-            {!submitting && (
-              <div className="captcha-container" style={{ marginBottom: "1.5rem", display: "flex", justifyContent: "center" }}>
-                <div 
-                  className="g-recaptcha" 
-                  data-sitekey="6Le-g4ssAAAAAESvbgGLOgYqXV3FdXp_FQL3xAk9"
-                ></div>
-              </div>
-            )}
+            {/* reCAPTCHA disabled */}
 
             {/* Submit button */}
             {!submitting && (
